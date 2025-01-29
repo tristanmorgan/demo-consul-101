@@ -5,7 +5,6 @@ package main
 
 import (
 	"encoding/json"
-	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -18,10 +17,40 @@ import (
 	"github.com/gorilla/mux"
 	gosocketio "github.com/graarh/golang-socketio"
 	"github.com/graarh/golang-socketio/transport"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const (
+	promNamespace = "dashboard"
+	promSubsystem = "http"
 )
 
 var countingServiceURL string
 var port string
+var (
+	activeConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: promNamespace,
+		Subsystem: promSubsystem,
+		Name:      "active_conn",
+	})
+	activeConnectionsCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: promNamespace,
+		Subsystem: promSubsystem,
+		Name:      "active_conn_count",
+	})
+	connectionFailure = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: promNamespace,
+		Subsystem: promSubsystem,
+		Name:      "conn_failure",
+	})
+	connectionFailureCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: promNamespace,
+		Subsystem: promSubsystem,
+		Name:      "conn_failure_count",
+	})
+)
 
 func main() {
 	port = getEnvOrDefault("PORT", "80")
@@ -37,13 +66,26 @@ func main() {
 	failTrack := new(failureTracker)
 
 	router := mux.NewRouter()
+	router.Use(prometheusMiddleware)
 	router.PathPrefix("/socket.io/").Handler(startWebsocket(failTrack))
 	router.HandleFunc("/health", HealthHandler)
 	router.HandleFunc("/health/api", HealthAPIHandler(failTrack))
-	router.Handle("/metrics", expvar.Handler())
+	router.Handle("/metrics", promhttp.Handler())
 	router.PathPrefix("/").Handler(http.FileServer(rice.MustFindBox("assets").HTTPBox()))
 
 	log.Fatal(http.ListenAndServe(portWithColon, router))
+}
+
+// prometheusMiddleware implements mux.MiddlewareFunc.
+func prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		activeConnections.Inc()
+		activeConnectionsCount.Inc()
+		defer func() {
+			activeConnections.Dec()
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func getEnvOrDefault(key, fallback string) string {
@@ -74,7 +116,9 @@ func (ft *failureTracker) Count(ok bool) {
 		ft.failures = 0
 	} else {
 		ft.failures++
+		connectionFailureCount.Inc()
 	}
+	connectionFailure.Set(float64(ft.failures))
 }
 
 func (ft *failureTracker) Status() (bool, int) {

@@ -15,9 +15,30 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/hashicorp/consul/api"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var consulPersistPath string
+
+const (
+	promNamespace = "counting"
+	promSubsystem = "http"
+)
+
+var (
+	activeConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: promNamespace,
+		Subsystem: promSubsystem,
+		Name:      "active_conn",
+	})
+	activeConnectionsCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: promNamespace,
+		Subsystem: promSubsystem,
+		Name:      "active_conn_count",
+	})
+)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -30,6 +51,8 @@ func main() {
 	fmt.Printf("Saving count at \"%s\"\n(Pass as COUNTING_PATH environment variable)\n", consulPersistPath)
 
 	router := mux.NewRouter()
+	router.Use(prometheusMiddleware)
+	router.Handle("/metrics", promhttp.Handler())
 	router.HandleFunc("/health", HealthHandler)
 
 	var index uint64
@@ -74,6 +97,18 @@ func (h CountHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	responseJSON, _ := json.Marshal(count)
 	fmt.Fprintf(w, string(responseJSON))
+}
+
+// prometheusMiddleware implements mux.MiddlewareFunc.
+func prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		activeConnections.Inc()
+		activeConnectionsCount.Inc()
+		defer func() {
+			activeConnections.Dec()
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func getStartingIndex(index *uint64) {
